@@ -10,7 +10,7 @@ AI-powered City Intelligence System built with **Streamlit**, **LangChain** & **
 
 | | |
 |---|---|
-| 🌐 **Live Demo** | _Coming soon (will be updated after deployment)_ |
+| 🌐 **Live Demo** | [City-Intelligence-AI](https://city-intelligence-ai.streamlit.app/) |
 | 💻 **Project Repository** | [City-Intelligence-System](https://github.com/Sheharyar-Sarmad/City-Intelligence-System) |
 | 📚 **AI Zero to Hero (full series)** | [ai-zero-to-hero](https://github.com/Sheharyar-Sarmad/ai-zero-to-hero) |
 | 📖 **GenAI Part 3 lesson** | [23_genai_3](https://github.com/Sheharyar-Sarmad/ai-zero-to-hero/tree/main/23_genai_3) |
