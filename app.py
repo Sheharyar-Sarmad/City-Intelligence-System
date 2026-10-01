@@ -13,8 +13,8 @@ from tavily import TavilyClient
 
 from langchain_groq import ChatGroq
 from langchain_core.tools import tool
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langchain_core.runnables import RunnableLambda, RunnableConfig
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
@@ -205,10 +205,10 @@ def parse_agent_output(result: dict[str, Any]) -> dict[str, Any]:
     return {"answer": answer, "interrupts": interrupts, "tools": tools}
 
 
-# Agent Chains
+# Agent
 
 @st.cache_resource(show_spinner=False)
-def build_chains(require_approval: bool):
+def build_agent(require_approval: bool):
     llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.5, max_tokens=700)
 
     middleware = []
@@ -218,7 +218,7 @@ def build_chains(require_approval: bool):
             HumanInTheLoopMiddleware(interrupt_on={"get_weather": policy, "get_news": policy})
         )
 
-    agent = create_agent(
+    return create_agent(
         model=llm,
         tools=[get_weather, get_news],
         system_prompt=(
@@ -231,18 +231,6 @@ def build_chains(require_approval: bool):
         middleware=middleware,
         checkpointer=InMemorySaver(),
     )
-
-    prepare_input = RunnableLambda(
-        lambda text: {"messages": [{"role": "user", "content": text}]}
-    )
-    prepare_resume = RunnableLambda(
-        lambda decisions: Command(resume={"decisions": decisions})
-    )
-    parse_output = RunnableLambda(parse_agent_output)
-
-    ask_chain = prepare_input | agent | parse_output
-    resume_chain = prepare_resume | agent | parse_output
-    return ask_chain, resume_chain
 
 
 # Session State & Sidebar
@@ -280,39 +268,10 @@ with st.sidebar:
     st.divider()
     usage_placeholder = st.empty()  # filled at the end of the script so it is always current
 
-ask_chain, resume_chain = build_chains(require_approval)
+agent = build_agent(require_approval)
 
 
-# Execution Helper
-
-def run_chain(chain, payload: Any) -> None:
-    config = {"configurable": {"thread_id": st.session_state.thread_id}}
-    try:
-        with st.spinner("🤖 Agent processing..."):
-            result = chain.invoke(payload, config=config)
-    except Exception as exc:
-        logger.exception("Agent run failed")
-        st.session_state.pending = None
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": f"The agent hit an error ({type(exc).__name__}). Try again, or start a new conversation.",
-            "tools": [],
-        })
-        return
-
-    if result["interrupts"]:
-        st.session_state.pending = result["interrupts"]
-        st.session_state.approval_round += 1
-    else:
-        st.session_state.pending = None
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": result["answer"] or "No response was produced.",
-            "tools": result["tools"],
-        })
-
-
-# UI Rendering
+# UI Helpers
 
 def tool_icon(name: str) -> str:
     return TOOL_ICONS.get(name, "🛠️")
@@ -338,25 +297,131 @@ def render_tavily_usage() -> None:
             st.warning("News search limit reached. Start a new conversation to reset it.")
 
 
-def render_approval(pending: list[dict[str, Any]]) -> None:
-    st.warning("⚠️ The agent requires approval to execute tool calls:")
-    round_id = st.session_state.approval_round
+# Execution (live progress + streaming)
 
-    with st.form(f"approval_form_{round_id}"):
-        choices = []
-        for i, action in enumerate(pending):
-            name = action.get("name", "unknown tool")
-            st.markdown(f"{tool_icon(name)} **Action:** `{name}`")
-            st.json(action.get("args", {}))
-            decision = st.radio(
-                "Decision", ["Approve", "Reject"],
-                key=f"decision_{round_id}_{i}", horizontal=True,
-            )
-            reason = st.text_input(
-                "Reason (if rejected)", key=f"reason_{round_id}_{i}",
-            )
-            choices.append((decision, reason))
-        submitted = st.form_submit_button("✅ Submit Decision")
+def run_agent(agent_input: Any) -> None:
+    """Run the agent and show its progress live inside an assistant chat bubble.
+
+    Steps shown: thinking, deciding on tool calls, running tools, analysing
+    results, and the final answer streaming in token by token.
+    """
+    config = {"configurable": {"thread_id": st.session_state.thread_id}}
+
+    with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
+        status = st.status("🧠 Agent is thinking...", expanded=True)
+        answer_box = st.empty()
+
+        state: dict[str, Any] | None = None
+        interrupt_value: Any = None
+        seen: int | None = None  # number of messages already reported
+        buffer = ""  # answer text streamed so far
+
+        try:
+            status.write("📨 Question received. Planning the next step...")
+
+            for mode, data in agent.stream(
+                agent_input, config=config, stream_mode=["messages", "values"]
+            ):
+                # Token stream: show the answer as it is being generated
+                if mode == "messages":
+                    chunk, _meta = data
+                    if isinstance(chunk, AIMessageChunk) and not chunk.tool_call_chunks:
+                        text = _message_text(chunk.content)
+                        if text:
+                            if not buffer:
+                                status.update(label="✍️ Generating answer...")
+                            buffer += text
+                            answer_box.markdown(buffer + "▌")
+                    continue
+
+                # State stream: report each completed step
+                if "__interrupt__" in data:
+                    interrupt_value = data["__interrupt__"]
+                if "messages" not in data:
+                    continue
+
+                state = data
+                messages = data["messages"]
+                if seen is None:
+                    seen = len(messages)
+                    continue
+
+                for m in messages[seen:]:
+                    if isinstance(m, AIMessage) and m.tool_calls:
+                        buffer = ""
+                        answer_box.empty()
+                        for call in m.tool_calls:
+                            status.write(
+                                f"{tool_icon(call['name'])} Decided to call `{call['name']}` "
+                                f"with `{call['args']}`"
+                            )
+                        status.update(label="🛠️ Running tools...")
+                    elif isinstance(m, ToolMessage):
+                        name = getattr(m, "name", None) or "tool"
+                        status.write(f"✅ `{name}` returned data")
+                        status.code(_message_text(m.content), language="text")
+                        status.update(label="🧠 Analysing the results...")
+                seen = len(messages)
+
+        except Exception as exc:
+            logger.exception("Agent run failed")
+            status.update(label="❌ Agent error", state="error", expanded=False)
+            error_text = f"The agent hit an error ({type(exc).__name__}). Try again, or start a new conversation."
+            answer_box.markdown(error_text)
+            st.session_state.pending = None
+            st.session_state.messages.append({"role": "assistant", "content": error_text, "tools": []})
+            return
+
+        final_state = dict(state or {})
+        if interrupt_value:
+            final_state["__interrupt__"] = interrupt_value
+        result = parse_agent_output(final_state)
+
+        # Waiting for the human to approve or reject the tool calls
+        if result["interrupts"]:
+            status.update(label="⏸️ Waiting for your approval", state="complete", expanded=False)
+            st.session_state.pending = result["interrupts"]
+            st.session_state.approval_round += 1
+            st.rerun()
+
+        answer = result["answer"] or "No response was produced."
+        n_tools = len(result["tools"])
+        status.update(
+            label=f"✅ Done ({n_tools} tool call{'s' if n_tools != 1 else ''})",
+            state="complete",
+            expanded=False,
+        )
+        answer_box.markdown(answer)
+
+        st.session_state.pending = None
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "tools": result["tools"],
+        })
+
+
+def render_approval(pending: list[dict[str, Any]]) -> None:
+    round_id = st.session_state.approval_round
+    box = st.empty()
+
+    with box.container():
+        st.warning("⚠️ The agent requires approval to execute tool calls:")
+        with st.form(f"approval_form_{round_id}"):
+            choices = []
+            for i, action in enumerate(pending):
+                name = action.get("name", "unknown tool")
+                st.markdown(f"{tool_icon(name)} **Action:** `{name}`")
+                st.json(action.get("args", {}))
+                decision = st.radio(
+                    "Decision", ["Approve", "Reject"],
+                    key=f"decision_{round_id}_{i}", horizontal=True,
+                )
+                reason = st.text_input(
+                    "Reason (if rejected)", key=f"reason_{round_id}_{i}",
+                )
+                choices.append((decision, reason))
+            submitted = st.form_submit_button("✅ Submit Decision")
 
     if submitted:
         decisions = []
@@ -369,7 +434,8 @@ def render_approval(pending: list[dict[str, Any]]) -> None:
                     "message": reason.strip() or "The user denied this tool call.",
                 })
         st.session_state.pending = None
-        run_chain(resume_chain, decisions)
+        box.empty()  # remove the form while the agent continues
+        run_agent(Command(resume={"decisions": decisions}))
 
 
 # Main Application
@@ -383,14 +449,15 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
         render_tools(msg.get("tools", []))
 
-pending = st.session_state.pending
-if pending:
-    render_approval(pending)
+if st.session_state.pending:
+    render_approval(st.session_state.pending)
 
-prompt = st.chat_input("🔍 Ask about a city", disabled=bool(pending))
+prompt = st.chat_input("🔍 Ask about a city", disabled=bool(st.session_state.pending))
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt, "tools": []})
-    run_chain(ask_chain, prompt)
+    with st.chat_message("user", avatar=USER_AVATAR):
+        st.markdown(prompt)
+    run_agent({"messages": [{"role": "user", "content": prompt}]})
 
 # Refresh usage display after any run so the count is always current
 render_tavily_usage()
