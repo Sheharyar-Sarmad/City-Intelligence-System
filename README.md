@@ -153,4 +153,4 @@ python cli_base_app.py
 - LinkedIn: [sheharyar-sarmad](https://www.linkedin.com/in/sheharyar-sarmad-9b7736289/)
 - GitHub: [Sheharyar-Sarmad](https://github.com/Sheharyar-Sarmad)
 
-Part of the [**ai-zero-to-hero**](https://github.com/Sheharyar-Sarmad/ai-zero-to-hero) learning journey. If you found this useful, consider giving the repo a ⭐.#
+Part of the [**ai-zero-to-hero**](https://github.com/Sheharyar-Sarmad/ai-zero-to-hero) learning journey. If you found this useful, consider giving the repo a ⭐.
