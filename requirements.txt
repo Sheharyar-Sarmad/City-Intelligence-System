@@ -1,0 +1,9 @@
+langchain
+langchain-community
+langchain-core
+langchain-tavily
+langchain-groq
+rich
+python-dotenv
+tavily
+streamlit
